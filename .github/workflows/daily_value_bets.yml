@@ -1,0 +1,142 @@
+name: Daily Value Bet Finder
+
+# GitHub Actions cron schedules run in UTC, and this repo's config also
+# treats everything as UTC, so no timezone conversion is needed anywhere.
+#
+# NOTE: GitHub's scheduler is best-effort and can be delayed by a few
+# minutes during peak load, especially right at the top of the hour.
+# Scheduling at 08:45 UTC (rather than exactly 09:00) gives a bit of
+# buffer while still comfortably beating the 10:00 UTC deadline.
+on:
+  schedule:
+    - cron: "45 8 * * *"
+  workflow_dispatch:        # lets you trigger a run manually from the Actions tab
+    inputs:
+      dry_run:
+        description: "Run everything but skip sending the email"
+        type: boolean
+        default: false
+
+# Needed so the job can commit the updated history.db back to the repo.
+permissions:
+  contents: write
+
+# Prevent two runs overlapping (e.g. a manual trigger firing while the
+# scheduled run is still in progress) from racing to commit history.db.
+concurrency:
+  group: value-bet-finder-run
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Full history isn't needed, but fetch-depth 0 avoids any edge
+          # cases with the later "git pull --rebase" if another run
+          # committed in the meantime.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Ensure we're on the latest commit before running
+        # Cheap insurance against a stale checkout (e.g. a queued run
+        # picking up a slightly outdated ref). The concurrency group above
+        # already prevents true overlap, but this costs nothing and rules
+        # out one more source of the "stale base" problem described below.
+        run: |
+          git fetch origin ${{ github.ref_name }}
+          git reset --hard origin/${{ github.ref_name }}
+
+      - name: Run daily value bet analysis
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          # Repo-relative paths so the DB/log land inside the checkout and
+          # can be committed back below.
+          DATABASE_PATH: ${{ github.workspace }}/history.db
+          LOG_PATH: ${{ github.workspace }}/finder.log
+          LOG_LEVEL: INFO
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: python main.py
+
+      - name: Upload log as a build artifact
+        if: always()   # keep the log even if the run above failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: finder-log-${{ github.run_number }}
+          path: finder.log
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Persist history.db back to the repository
+        if: always()   # commit whatever state we ended up in, even on partial failure,
+                        # so learning progress and run_log entries are never lost
+        run: |
+          set -e
+          git config user.name "value-bet-finder-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+          if [ ! -f history.db ]; then
+            echo "No history.db produced this run - nothing to persist."
+            exit 0
+          fi
+
+          # IMPORTANT: we deliberately never run `git merge` or `git rebase`
+          # against history.db. Those try to reconcile two *divergent*
+          # binary blobs line-by-line, which always ends in the exact
+          # "CONFLICT (content): Merge conflict in history.db" error this
+          # section exists to prevent.
+          #
+          # Instead: stash today's freshly generated DB outside git's
+          # working tree, hard-reset the branch to whatever the remote's
+          # latest state actually is right now, drop the fresh DB back in
+          # as a single new commit on top, and push. If the push is
+          # rejected because another run snuck in between our fetch and
+          # our push, we just repeat the whole reset+recommit cycle - we
+          # never try to merge two versions of the file, we simply retry
+          # "latest remote + our update" until it lands cleanly.
+          cp history.db /tmp/history.db.new
+
+          attempt=1
+          max_attempts=5
+          while [ "$attempt" -le "$max_attempts" ]; do
+            echo "Push attempt $attempt/$max_attempts"
+
+            git fetch origin ${{ github.ref_name }}
+            git reset --hard origin/${{ github.ref_name }}
+            cp /tmp/history.db.new history.db
+
+            git add history.db
+            if git diff --cached --quiet; then
+              echo "No changes to history.db relative to latest remote - nothing to commit."
+              exit 0
+            fi
+
+            git commit -m "chore: update history.db from scheduled run #${{ github.run_number }}"
+
+            if git push origin HEAD:${{ github.ref_name }}; then
+              echo "Pushed successfully."
+              exit 0
+            fi
+
+            echo "Push rejected (likely a concurrent run) - retrying after a short backoff..."
+            attempt=$((attempt + 1))
+            sleep $(( (RANDOM % 10) + 5 ))
+          done
+
+          echo "Failed to push history.db after $max_attempts attempts." >&2
+          exit 1

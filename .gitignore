@@ -1,0 +1,22 @@
+# Secrets / local config - never commit real credentials
+.env
+
+# Logs - not essential to keep in git history; the workflow uploads them
+# as a build artifact on every run instead (see .github/workflows/).
+*.log
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+
+# OS noise
+.DS_Store
+
+# NOTE: history.db is intentionally NOT ignored. The GitHub Actions
+# workflow commits it back to the repo after every run so the learning
+# loop (team ratings, calibration, prediction history) persists across
+# runs on GitHub's ephemeral runners. See README.md, section "Deploying
+# on GitHub Actions".
