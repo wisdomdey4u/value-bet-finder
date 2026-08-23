@@ -1,0 +1,9 @@
+# Value Bet Finder - dependencies
+# Install with: pip install -r requirements.txt --user
+# (sqlite3, smtplib, datetime, logging are all in the Python standard
+#  library and are listed here only for documentation purposes.)
+
+requests>=2.31
+numpy>=1.24
+scipy>=1.10
+python-dotenv>=1.0,<2.0
