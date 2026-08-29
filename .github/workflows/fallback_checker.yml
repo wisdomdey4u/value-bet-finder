@@ -1,0 +1,83 @@
+name: Value Bet Finder - Fallback Safety Net
+
+# Runs at 09:50 UTC -- 10 minutes before the 10:00 UTC delivery deadline.
+# Only retries the primary workflow if today's run hasn't succeeded yet.
+#
+# IMPORTANT CAVEAT: this trigger uses the same GitHub Actions scheduler as
+# the primary workflow. If the primary's delays are caused by a genuine
+# account/repo-level scheduling backlog (rather than something specific to
+# its own cron expression), THIS trigger can be delayed by the same
+# mechanism and may not fire at 09:50 either. Treat this as a second line
+# of defense, not a guarantee -- see README.md "Delivery reliability" for
+# a genuinely scheduler-independent alternative using an external cron
+# service to call the GitHub API directly.
+on:
+  schedule:
+    - cron: "50 9 * * *"
+  workflow_dispatch: {}   # lets you test this checker on demand
+
+# actions:write is required to call createWorkflowDispatch below --
+# actions:read alone will 403 on that call.
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  check_and_retry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if today's run already succeeded
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const today = new Date().toISOString().split('T')[0]; // UTC date
+
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'daily_value_bets.yml',
+              per_page: 10,
+              status: 'completed',
+            });
+
+            const successToday = runs.data.workflow_runs.some(run => {
+              const runDate = new Date(run.created_at).toISOString().split('T')[0];
+              return runDate === today && run.conclusion === 'success';
+            });
+
+            if (successToday) {
+              console.log("Today's run already succeeded. No retry needed.");
+              core.setOutput('should_retry', 'false');
+            } else {
+              console.log("No successful run found for today (UTC). Triggering fallback...");
+              core.setOutput('should_retry', 'true');
+            }
+
+      - name: Trigger fallback run if needed
+        if: steps.check.outputs.should_retry == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'daily_value_bets.yml',
+              ref: 'main',
+            });
+            console.log('Fallback run triggered.');
+
+      # Writes to the run's own Job Summary tab -- always visible in the
+      # Actions UI with zero external dependency, unlike commenting on a
+      # specific issue number that may not exist in this repo.
+      - name: Record outcome in the job summary
+        if: always()
+        run: |
+          if [ "${{ steps.check.outputs.should_retry }}" == "true" ]; then
+            echo "### :warning: Fallback triggered" >> "$GITHUB_STEP_SUMMARY"
+            echo "No successful run was found for today (UTC) by 09:50 UTC." >> "$GITHUB_STEP_SUMMARY"
+            echo "A retry of \`daily_value_bets.yml\` was dispatched at $(date -u +%H:%M:%SZ)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### :white_check_mark: No action needed" >> "$GITHUB_STEP_SUMMARY"
+            echo "Today's run already completed successfully - fallback skipped, no extra API cost." >> "$GITHUB_STEP_SUMMARY"
+          fi
