@@ -59,7 +59,12 @@ jobs:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          ODDS_REGIONS: ${{ secrets.ODDS_REGIONS }}
+          # || falls back to a safe default if the ODDS_REGIONS secret is
+          # unset. IMPORTANT: without the `|| 'eu,uk'` fallback, an unset
+          # secret still sets this env var to an EMPTY STRING (not "unset"),
+          # which the Odds API rejects outright with INVALID_REGION -- this
+          # bit us on 2026-08-29 without the fallback in place.
+          ODDS_REGIONS: ${{ secrets.ODDS_REGIONS || 'eu,uk' }}
           DATABASE_PATH: ${{ github.workspace }}/history.db
           LOG_PATH: ${{ github.workspace }}/finder.log
           LOG_LEVEL: INFO
