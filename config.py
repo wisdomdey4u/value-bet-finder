@@ -94,6 +94,14 @@ ODDS_MARKETS = os.environ.get("ODDS_MARKETS", "h2h,spreads,totals")
 # Betting / value engine parameters
 # ---------------------------------------------------------------------------
 MIN_VALUE_THRESHOLD = _get_float("MIN_VALUE_THRESHOLD", 0.05)   # 5% edge minimum
+# Minimum required edge against the multi-book no-vig CONSENSUS (model_prob
+# vs the average no-vig probability across every bookmaker with complete
+# market data) -- not just positive EV against a single best-priced book.
+# Added 2026-09-05 alongside the value_calculator.py fix: without this, a
+# single outlier/stale bookmaker price could clear MIN_VALUE_THRESHOLD on
+# its own even when every other book disagreed, which was inflating picks
+# with no real edge. See value_calculator.select_top_picks().
+MIN_EDGE_THRESHOLD = _get_float("MIN_EDGE_THRESHOLD", 0.03)     # 3% edge vs consensus minimum
 # Sanity ceiling: reject anything implausibly good, which usually signals
 # bad/stale data rather than a genuine opportunity.
 MAX_VALUE_THRESHOLD = _get_float("MAX_VALUE_THRESHOLD", 0.60)   # 60% edge maximum
