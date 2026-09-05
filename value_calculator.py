@@ -12,6 +12,34 @@ Value definition used throughout:
     model_probability          = our estimated true probability (calibrated)
     estimated_edge             = model_probability - no_vig_market_probability
     expected_value             = model_probability * decimal_odds - 1
+
+--------------------------------------------------------------------------
+FIX (see finder.log / history.db review, 2026-09-05): two bugs were found
+in the previous version of this file:
+
+  BUG A - no_vig_prob and the "odds" actually being bet came from TWO
+  DIFFERENT, independently-chosen bookmakers (best_price() picks the
+  single highest price across ALL books; the old _market_no_vig_prob()
+  picked whichever book happened to be first in the list with complete
+  data). That produced impossible results like a no-vig probability of
+  83.6% attached to odds that only imply 45.5% -- comparing one book's
+  price against a completely unrelated book's market view. FIXED below:
+  _market_no_vig_prob() now AVERAGES the no-vig probability across every
+  bookmaker that has complete data for the market, giving a genuine
+  multi-book consensus instead of an arbitrary single book's number.
+
+  BUG B - pick selection never actually used the no-vig consensus /
+  "edge" at all; select_top_picks() filtered purely on
+  expected_value = model_prob * odds - 1, using whatever the single
+  highest-priced bookmaker happened to offer. Across many independent
+  bookmakers, the maximum of N quotes is a biased-high estimate almost by
+  definition -- some of that "best price" is genuine value, but a lot of
+  it is just a stale line or a single outlier book, and nothing was
+  checking the outlier price against what the rest of the market thinks.
+  FIXED below: a candidate must now ALSO show a positive edge against the
+  (correctly computed) consensus no-vig probability, not just positive EV
+  against one cherry-picked price. See MIN_EDGE_THRESHOLD in config.py.
+--------------------------------------------------------------------------
 """
 
 import logging
@@ -48,9 +76,20 @@ MARKET_OUTCOME_MAP = {
 
 def remove_vig(prices: dict) -> dict:
     """
-    Given {outcome_name: decimal_odds} for a single market, return
-    {outcome_name: no_vig_probability} with the bookmaker margin stripped
-    out via simple proportional (multiplicative) normalisation.
+    Given {outcome_name: decimal_odds} for a single market (i.e. all prices
+    from ONE bookmaker), return {outcome_name: no_vig_probability} with the
+    bookmaker's margin stripped out via simple proportional (multiplicative)
+    normalisation.
+
+    IMPORTANT: this must only ever be called with prices from a single
+    bookmaker's own complete market. Mixing the best price for one outcome
+    from book A with another outcome's price from book B is a different
+    (illegitimate) calculation -- it can produce an implied-probability sum
+    below 100%, which inflates every normalised probability upward. This
+    function itself doesn't mix books; callers must not either (see
+    _market_no_vig_prob below for the correct multi-book consensus, which
+    averages several *independently valid* single-book no-vig results
+    rather than mixing raw prices across books).
     """
     raw_implied = {name: 1.0 / odds for name, odds in prices.items() if odds and odds > 1.0}
     total = sum(raw_implied.values())
@@ -61,7 +100,15 @@ def remove_vig(prices: dict) -> dict:
 
 def best_price(match: dict, market_key: str, outcome_name: str):
     """Scan all bookmakers for a match and return the best (highest) price
-    for a given market/outcome, along with which bookmaker offered it."""
+    for a given market/outcome, along with which bookmaker offered it.
+
+    NOTE: this is intentionally still "take the best price" -- that's
+    correct practice for the price you'd actually get if you placed the
+    bet (line shopping). The fix for outlier/stale prices lives in
+    generate_candidates(), which now also requires a positive edge against
+    the multi-book consensus (see _market_no_vig_prob), not just a
+    positive EV against this single best price alone.
+    """
     best_odds = None
     best_book = None
     for bm in match.get("bookmakers", []):
@@ -79,9 +126,20 @@ def best_price(match: dict, market_key: str, outcome_name: str):
 
 
 def _market_no_vig_prob(match: dict, market_key: str, outcome_name: str, all_outcome_names: list):
-    """Compute the no-vig probability for one outcome using the *same*
-    bookmaker's full set of prices for that market (consensus: first
-    bookmaker that quotes all outcomes)."""
+    """
+    Compute a genuine multi-book CONSENSUS no-vig probability for one
+    outcome: for every bookmaker that quotes the FULL set of outcomes for
+    this market, compute that single book's own no-vig probability (a
+    legitimate, single-book calculation), then average those per-book
+    results across all qualifying books.
+
+    This deliberately does NOT mix raw prices across bookmakers (that was
+    bug A) -- each book's no-vig figure is computed entirely from its own
+    prices, and only the final *results* are averaged together. Requiring
+    at least 2 books to agree also makes this a much better sanity check
+    than trusting a single arbitrary "first found" bookmaker.
+    """
+    per_book_no_vig = []
     for bm in match.get("bookmakers", []):
         market = bm.get("markets", {}).get(market_key)
         if not market:
@@ -89,10 +147,15 @@ def _market_no_vig_prob(match: dict, market_key: str, outcome_name: str, all_out
         if not all(name in market for name in all_outcome_names):
             continue
         prices = {name: market[name]["price"] for name in all_outcome_names if market[name].get("price")}
+        if len(prices) != len(all_outcome_names):
+            continue
         no_vig = remove_vig(prices)
         if outcome_name in no_vig:
-            return no_vig[outcome_name]
-    return None
+            per_book_no_vig.append(no_vig[outcome_name])
+
+    if not per_book_no_vig:
+        return None
+    return sum(per_book_no_vig) / len(per_book_no_vig)
 
 
 def generate_candidates(match: dict, probs: MatchProbabilities, db: Database, model_confidence: float) -> list:
@@ -183,26 +246,39 @@ def justify(candidate: dict) -> str:
         f"{candidate['no_vig_prob']*100:.1f}%" if candidate["no_vig_prob"] is not None else "n/a"
     )
     return (
-        f"Model estimates {candidate['model_prob']*100:.1f}% vs bookmaker's "
-        f"no-vig {no_vig_pct} implied probability, an edge of {edge_pct}. "
+        f"Model estimates {candidate['model_prob']*100:.1f}% vs the multi-book "
+        f"no-vig consensus of {no_vig_pct}, an edge of {edge_pct}. "
         f"Expected value {candidate['expected_value']*100:.1f}% at odds {candidate['odds']:.2f}."
     )
 
 
 def select_top_picks(all_candidates: list, min_value: float = None,
-                      max_picks: int = None, max_per_market: int = None) -> list:
+                      max_picks: int = None, max_per_market: int = None,
+                      min_edge: float = None) -> list:
     """
     Rank candidates by expected value and greedily select the top picks
     subject to:
-      - minimum expected value threshold
+      - minimum expected value threshold (model_prob vs the actual price
+        being bet at)
+      - minimum EDGE threshold (model_prob vs the multi-book no-vig
+        CONSENSUS) -- this is the fix for bug B: a candidate is no longer
+        accepted just because one outlier bookmaker offered a generous
+        price; the rest of the market must also disagree with that price
+        by a meaningful margin, or we don't trust it.
       - at most one bet per match
       - at most `max_per_market` bets from the same market
     """
     min_value = min_value if min_value is not None else config.MIN_VALUE_THRESHOLD
+    min_edge = min_edge if min_edge is not None else getattr(config, "MIN_EDGE_THRESHOLD", 0.03)
     max_picks = max_picks or config.MAX_PICKS_PER_DAY
     max_per_market = max_per_market or config.MAX_PICKS_PER_MARKET
 
-    eligible = [c for c in all_candidates if c["expected_value"] >= min_value]
+    eligible = [
+        c for c in all_candidates
+        if c["expected_value"] >= min_value
+        and c["edge"] is not None
+        and c["edge"] >= min_edge
+    ]
     eligible.sort(key=lambda c: c["expected_value"], reverse=True)
 
     picks = []
@@ -223,8 +299,9 @@ def select_top_picks(all_candidates: list, min_value: float = None,
 
     if len(picks) < max_picks:
         logger.warning(
-            "Only found %d/%d value bets meeting the %.1f%% threshold today.",
-            len(picks), max_picks, min_value * 100,
+            "Only found %d/%d value bets meeting the %.1f%% EV / %.1f%% edge-vs-consensus "
+            "thresholds today.",
+            len(picks), max_picks, min_value * 100, min_edge * 100,
         )
     return picks
 
