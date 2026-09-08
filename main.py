@@ -3,7 +3,7 @@
 main.py
 -------
 Orchestrates one full daily run of the Value Bet Finder:
-
+ 
   1. Set up logging.
   2. Validate required environment variables / secrets.
   3. Open (or create) the SQLite history database.
@@ -19,28 +19,29 @@ Orchestrates one full daily run of the Value Bet Finder:
      learned from later).
   9. Compose and send the summary email, with retry on transient failures.
  10. Log a one-line run summary to the `run_log` table for observability.
-
+ 
 Run this as:
     python main.py
-
+ 
 On PythonAnywhere, point a scheduled ("Tasks") job at this exact command,
 scheduled for 09:00 UTC, so there is a comfortable margin before the
 10:00 UTC delivery deadline even if the odds API or SMTP is briefly slow.
 """
-
+ 
 import sys
 import logging
 import datetime as dt
 from logging.handlers import RotatingFileHandler
-
+ 
 import config
 from database import Database
 from api_client import fetch_todays_matches, ApiClientError
 from value_calculator import build_candidates_for_all_matches, select_top_picks, justify
 from learning import run_learning_cycle
 from email_sender import compose_email, send_email
-
-
+from probability_models import MarkovFormModel
+ 
+ 
 def setup_logging():
     """Configure root logging: rotating file handler + optional console."""
     root = logging.getLogger()
@@ -49,21 +50,21 @@ def setup_logging():
         "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
+ 
     file_handler = RotatingFileHandler(
         config.LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
     file_handler.setFormatter(fmt)
     root.addHandler(file_handler)
-
+ 
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(fmt)
     root.addHandler(console_handler)
-
+ 
     # requests/urllib3 are noisy at INFO; keep them at WARNING.
     logging.getLogger("urllib3").setLevel(logging.WARNING)
-
-
+ 
+ 
 def run_daily_cycle() -> int:
     """Executes the full pipeline once. Returns a process exit code
     (0 = success, 1 = completed with issues, 2 = fatal error)."""
@@ -71,15 +72,15 @@ def run_daily_cycle() -> int:
     run_started = dt.datetime.now(dt.timezone.utc)
     logger.info("=" * 70)
     logger.info("Value Bet Finder - daily run starting at %s", run_started.isoformat())
-
+ 
     try:
         config.validate_required_config()
     except EnvironmentError as exc:
         logger.error(str(exc))
         return 2
-
+ 
     db = Database()
-
+ 
     # ------------------------------------------------------------------
     # 1. Learning cycle: settle past predictions + recalibrate.
     #    Safe to run every day; it is a no-op when there is nothing new
@@ -90,7 +91,7 @@ def run_daily_cycle() -> int:
         run_learning_cycle(db)
     except Exception:
         logger.exception("Learning cycle raised an unexpected error; continuing with today's picks anyway")
-
+ 
     # ------------------------------------------------------------------
     # 2. Fetch today's matches + odds.
     # ------------------------------------------------------------------
@@ -101,19 +102,25 @@ def run_daily_cycle() -> int:
         db.log_run(0, 0, 0, "FAILED", "Odds API fetch failed")
         _send_failure_email(run_started, "Could not fetch match/odds data from the API. See finder.log.")
         return 2
-
+ 
     if not matches:
         logger.warning("No matches found for today (UTC). Sending an empty-picks email.")
         subject, text_body, html_body = compose_email([], run_started, 0)
         _deliver(subject, text_body, html_body)
         db.log_run(0, 0, 0, "NO_MATCHES", "")
         return 0
-
+ 
     # ------------------------------------------------------------------
     # 3. Build candidates across every match/market.
+    #    MarkovFormModel wraps the base Poisson/Elo model with a recent-
+    #    form adjustment; it safely falls back to the unadjusted base
+    #    model for any team without enough settled history yet (see
+    #    MIN_MATCHES_FOR_MARKOV in probability_models.py), so this is a
+    #    no-op today while the database is still cold-starting.
     # ------------------------------------------------------------------
-    all_candidates = build_candidates_for_all_matches(matches, db)
-
+    model = MarkovFormModel(db)
+    all_candidates = build_candidates_for_all_matches(matches, db, model=model)
+ 
     # Drop candidates we don't yet have enough team history to trust, and
     # anything with an implausibly large "value" (usually bad/stale data
     # rather than a genuine edge).
@@ -124,14 +131,14 @@ def run_daily_cycle() -> int:
         and c["model_prob"] >= 0.0
     ]
     logger.info("%d/%d candidates passed confidence/sanity filters", len(filtered), len(all_candidates))
-
+ 
     # ------------------------------------------------------------------
     # 4. Select the final diversified picks.
     # ------------------------------------------------------------------
     picks = select_top_picks(filtered)
     for pick in picks:
         pick["justification"] = justify(pick)
-
+ 
     # ------------------------------------------------------------------
     # 5. Persist picks to the database so they can be settled & learned
     #    from once the matches have been played.
@@ -159,41 +166,41 @@ def run_daily_cycle() -> int:
         except Exception:
             logger.exception("Failed to persist prediction for %s vs %s",
                               pick.get("home_team"), pick.get("away_team"))
-
+ 
     # ------------------------------------------------------------------
     # 6. Compose + send the email.
     # ------------------------------------------------------------------
     subject, text_body, html_body = compose_email(picks, run_started, len(matches))
     sent_ok = _deliver(subject, text_body, html_body)
-
+ 
     status = "OK" if picks and sent_ok else ("SENT_NO_PICKS" if sent_ok else "EMAIL_FAILED")
     db.log_run(len(matches), len(all_candidates), len(picks), status,
                f"{len(picks)} picks selected from {len(filtered)} filtered candidates")
-
+ 
     if len(picks) < config.MAX_PICKS_PER_DAY:
         logger.warning(
             "Delivered only %d/%d picks today (not enough candidates cleared the "
             "%.0f%% value threshold / diversity rules).",
             len(picks), config.MAX_PICKS_PER_DAY, config.MIN_VALUE_THRESHOLD * 100,
         )
-
+ 
     if not sent_ok:
         logger.error("Email delivery ultimately failed after retries.")
         return 1
-
+ 
     run_finished = dt.datetime.now(dt.timezone.utc)
     logger.info("Run complete in %.1fs. Picks sent: %d", (run_finished - run_started).total_seconds(), len(picks))
     return 0
-
-
+ 
+ 
 def _deliver(subject: str, text_body: str, html_body: str) -> bool:
     logger = logging.getLogger("value_bet_finder.main")
     if config.DRY_RUN:
         logger.info("DRY_RUN enabled - skipping actual email send. Subject: %s", subject)
         return True
     return send_email(subject, text_body, html_body)
-
-
+ 
+ 
 def _send_failure_email(run_started: dt.datetime, reason: str):
     """Best-effort notification email when the pipeline fails before it can
     even generate picks, so a human finds out promptly rather than the
@@ -206,9 +213,11 @@ def _send_failure_email(run_started: dt.datetime, reason: str):
         send_email(subject, text_body, html_body)
     except Exception:
         logger.exception("Even the failure-notification email could not be sent")
-
-
+ 
+ 
 if __name__ == "__main__":
     setup_logging()
     exit_code = run_daily_cycle()
     sys.exit(exit_code)
+ 
+
