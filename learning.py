@@ -44,7 +44,8 @@ def _expected_goals_for_team(is_home: bool, team_rating: dict, opp_rating: dict,
 
 def _update_team_after_match(db: Database, team: str, league: str, goals_for: int,
                               goals_against: int, expected_goals_for: float,
-                              opponent_elo: float, is_home: bool, result: str):
+                              opponent_elo: float, is_home: bool, result: str,
+                              league_avg: dict):
     rating = db.get_team_rating(team, league)
     lr = config.RATING_LEARNING_RATE
 
@@ -59,7 +60,7 @@ def _update_team_after_match(db: Database, team: str, league: str, goals_for: in
 
     # Defense strength: fewer goals conceded than expected -> defense improves
     # (defense multiplier < 1.0 means opponents score less against this team).
-    league_avg_goals = 1.35  # rough overall goals/team/match reference point
+    league_avg_goals = league_avg["avg_home_goals"] if is_home else league_avg["avg_away_goals"]
     conceded_ratio = goals_against / league_avg_goals if league_avg_goals > 0 else 1.0
     conceded_ratio = min(3.0, max(0.1, conceded_ratio))
     new_defense = rating["defense"] * (1 - lr) + rating["defense"] * conceded_ratio * lr
@@ -119,7 +120,7 @@ def settle_and_update_ratings(db: Database):
         league = score["league"]
         home, away = score["home_team"], score["away_team"]
         hs, as_ = score["home_score"], score["away_score"]
-        key = (score["match_id"],)
+        key = (score["match_id"], league)
         if key in updated_teams:
             continue
         updated_teams.add(key)
@@ -139,9 +140,9 @@ def settle_and_update_ratings(db: Database):
             home_result = away_result = "DRAW"
 
         _update_team_after_match(db, home, league, hs, as_, exp_home_goals,
-                                  away_rating["elo"], True, home_result)
+                                  away_rating["elo"], True, home_result, league_avg)
         _update_team_after_match(db, away, league, as_, hs, exp_away_goals,
-                                  home_rating["elo"], False, away_result)
+                                  home_rating["elo"], False, away_result, league_avg)
 
         db.update_league_average(league, hs, as_)
 

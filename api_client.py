@@ -109,9 +109,6 @@ def fetch_todays_matches() -> list:
     total_raw_events = 0
 
     for league in config.SOCCER_LEAGUES:
-        league = league.strip()
-        if not league:
-            continue
         url = f"{config.ODDS_API_BASE_URL}/sports/{league}/odds"
         params = {
             "apiKey": config.ODDS_API_KEY,
@@ -208,15 +205,13 @@ def fetch_recent_scores(days_from: int = None) -> list:
         {"match_id", "league", "completed", "home_team", "away_team",
          "home_score", "away_score"}
     """
-    days_from = days_from or config.SCORES_DAYS_FROM
+    if days_from is None:
+        days_from = config.SCORES_DAYS_FROM
     if not config.ODDS_API_KEY:
         raise ApiClientError("ODDS_API_KEY is not configured")
 
     all_scores = []
     for league in config.SOCCER_LEAGUES:
-        league = league.strip()
-        if not league:
-            continue
         url = f"{config.ODDS_API_BASE_URL}/sports/{league}/scores"
         params = {
             "apiKey": config.ODDS_API_KEY,

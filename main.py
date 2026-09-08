@@ -120,7 +120,7 @@ def run_daily_cycle() -> int:
     filtered = [
         c for c in all_candidates
         if c["confidence"] >= config.MIN_MODEL_CONFIDENCE
-        and c["expected_value"] <= getattr(config, "MAX_VALUE_THRESHOLD", 0.60)
+        and c["expected_value"] <= config.MAX_VALUE_THRESHOLD
         and c["model_prob"] >= 0.0
     ]
     logger.info("%d/%d candidates passed confidence/sanity filters", len(filtered), len(all_candidates))

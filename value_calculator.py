@@ -154,10 +154,17 @@ def generate_candidates(match: dict, probs: MatchProbabilities, db: Database, mo
     # --- Team Over 1.5 (secondary market, uses team_totals if the book offers it) ---
     # The Odds API exposes team totals per side; we look for outcomes named
     # after the team with an "Over"/"Under" descriptor embedded in the market.
+    # Collect all team_totals outcomes across all bookmakers for proper no-vig.
+    home_over_outcomes = {}   # bookmaker -> (outcome_name, price)
+    home_under_outcomes = {}
+    away_over_outcomes = {}
+    away_under_outcomes = {}
+
     for bm in match.get("bookmakers", []):
         tt_market = bm.get("markets", {}).get("team_totals")
         if not tt_market:
             continue
+        book_name = bm.get("title") or bm.get("key")
         for outcome_name, outcome in tt_market.items():
             price = outcome.get("price")
             point = outcome.get("point")
@@ -165,13 +172,38 @@ def generate_candidates(match: dict, probs: MatchProbabilities, db: Database, mo
                 continue
             if abs(point - config.OVER_LINE_TEAM) > 0.01:
                 continue
-            if home_team in outcome_name and "Over" in outcome_name:
-                add_candidate("Team Over 1.5", f"{home_team} Over 1.5", "team_totals",
-                               outcome_name, [outcome_name], probs.home_over_1_5)
-            elif away_team in outcome_name and "Over" in outcome_name:
-                add_candidate("Team Over 1.5", f"{away_team} Over 1.5", "team_totals",
-                               outcome_name, [outcome_name], probs.away_over_1_5)
-        break  # one bookmaker's naming convention is enough to try
+            if home_team in outcome_name:
+                if "Over" in outcome_name:
+                    home_over_outcomes[book_name] = (outcome_name, price)
+                elif "Under" in outcome_name:
+                    home_under_outcomes[book_name] = (outcome_name, price)
+            elif away_team in outcome_name:
+                if "Over" in outcome_name:
+                    away_over_outcomes[book_name] = (outcome_name, price)
+                elif "Under" in outcome_name:
+                    away_under_outcomes[book_name] = (outcome_name, price)
+
+    # Home team Over 1.5
+    if home_over_outcomes and home_under_outcomes:
+        # Use the bookmaker offering the best Over price
+        best_book = max(home_over_outcomes, key=lambda b: home_over_outcomes[b][1])
+        best_outcome_name, best_odds_val = home_over_outcomes[best_book]
+        # Build full outcome set for no-vig using the same bookmaker
+        if best_book in home_under_outcomes:
+            under_outcome_name, under_price = home_under_outcomes[best_book]
+            all_outcomes = [best_outcome_name, under_outcome_name]
+            add_candidate("Team Over 1.5", f"{home_team} Over 1.5", "team_totals",
+                           best_outcome_name, all_outcomes, probs.home_over_1_5)
+
+    # Away team Over 1.5
+    if away_over_outcomes and away_under_outcomes:
+        best_book = max(away_over_outcomes, key=lambda b: away_over_outcomes[b][1])
+        best_outcome_name, best_odds_val = away_over_outcomes[best_book]
+        if best_book in away_under_outcomes:
+            under_outcome_name, under_price = away_under_outcomes[best_book]
+            all_outcomes = [best_outcome_name, under_outcome_name]
+            add_candidate("Team Over 1.5", f"{away_team} Over 1.5", "team_totals",
+                           best_outcome_name, all_outcomes, probs.away_over_1_5)
 
     return candidates
 

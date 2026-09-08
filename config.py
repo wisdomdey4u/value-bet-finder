@@ -71,12 +71,14 @@ ODDS_API_BASE_URL = os.environ.get("ODDS_API_BASE_URL", "https://api.the-odds-ap
 
 # Soccer league "sport keys" as defined by The Odds API. Extend this list to
 # cover more leagues; each extra league costs additional API quota.
-SOCCER_LEAGUES = os.environ.get(
-    "SOCCER_LEAGUES",
-    "soccer_epl,soccer_spain_la_liga,soccer_italy_serie_a,"
-    "soccer_germany_bundesliga,soccer_france_ligue_one,"
-    "soccer_uefa_champs_league"
-).split(",")
+SOCCER_LEAGUES = [
+    lg.strip() for lg in os.environ.get(
+        "SOCCER_LEAGUES",
+        "soccer_epl,soccer_spain_la_liga,soccer_italy_serie_a,"
+        "soccer_germany_bundesliga,soccer_france_ligue_one,"
+        "soccer_uefa_champs_league"
+    ).split(",") if lg.strip()
+]
 
 ODDS_REGIONS = os.environ.get("ODDS_REGIONS", "eu,uk")
 ODDS_FORMAT = "decimal"

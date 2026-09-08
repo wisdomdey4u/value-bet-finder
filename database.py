@@ -190,6 +190,62 @@ class Database:
                 "updated_at": None,
             }
 
+    def get_team_recent_results(self, team: str, league: str, limit: int = 10, venue: str = "both") -> list[dict]:
+        """Return recent settled matches for a team in a league.
+
+        Args:
+            team: Team name.
+            league: League name.
+            limit: Maximum number of matches to return.
+            venue: "home", "away", or "both".
+
+        Returns:
+            List of dicts with keys: home_team, away_team, home_score, away_score,
+            result (WIN/DRAW/LOSS from team's perspective), settled_at, is_home (bool).
+        """
+        if venue not in ("home", "away", "both"):
+            raise ValueError("venue must be 'home', 'away', or 'both'")
+
+        base_query = """
+            SELECT
+                home_team, away_team, home_score, away_score, result, settled_at,
+                (home_team = ?) AS is_home
+            FROM predictions
+            WHERE league = ?
+              AND result IN ('WON','LOST')
+              AND (home_team = ? OR away_team = ?)
+        """
+        params = [team, league, team, team]
+
+        if venue == "home":
+            base_query += " AND home_team = ?"
+            params.append(team)
+        elif venue == "away":
+            base_query += " AND away_team = ?"
+            params.append(team)
+
+        base_query += " ORDER BY settled_at DESC LIMIT ?"
+        params.append(limit)
+
+        with self._connect() as conn:
+            rows = conn.execute(base_query, params).fetchall()
+
+        results = []
+        for row in rows:
+            r = dict(row)
+            is_home = r.pop("is_home")
+            r["is_home"] = bool(is_home)
+
+            # Convert result from team's perspective
+            if r["result"] == "WON":
+                r["result"] = "WIN"
+            elif r["result"] == "LOST":
+                r["result"] = "LOSS"
+            # Note: DRAW is not in settled results per schema, but handle if present
+            results.append(r)
+
+        return results
+
     def upsert_team_rating(self, team: str, league: str, attack: float, defense: float,
                             elo: float, matches_played: int):
         with self._connect() as conn:
